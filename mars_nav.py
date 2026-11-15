@@ -3,7 +3,6 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import sys
-import time
 import json
 import heapq
 from io import BytesIO
@@ -13,6 +12,7 @@ import cv2
 import numpy as np
 import requests
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 from PIL import Image, ImageDraw
 import torch
 
@@ -57,89 +57,7 @@ midas, midas_transforms = load_depth_models(device)
 
 
 # ==========================================
-# 1. LIVE WOKWI ESP32 TELEMETRY INGESTION
-# ==========================================
-DEFAULT_WOKWI_TELEMETRY = {
-    "source": "DEFAULT_FALLBACK",
-    "radiation_msv_hr": 0.037,
-    "perchlorate_pct": 0.10,
-    "suit_kpa": 32.1,
-    "visibility_pct": 85.0,
-    "temp_c": -10.0,
-    "rad_hazard": False,
-    "salt_hazard": False,
-    "atmo_hazard": False,
-    "dust_hazard": False,
-    "temp_hazard": False,
-}
-
-
-def fetch_wokwi_telemetry(timeout_sec=3.0):
-    """Subscribes to HiveMQ to pull live 5-hazard telemetry from the Wokwi ESP32 simulator."""
-    if not HAS_MQTT:
-        print("[WARN] paho-mqtt not installed. Using nominal suit telemetry defaults.")
-        return DEFAULT_WOKWI_TELEMETRY.copy()
-
-    received = {}
-
-    def on_message(_client, _userdata, msg):
-        try:
-            data = json.loads(msg.payload.decode("utf-8"))
-            data["source"] = "LIVE_WOKWI_ESP32"
-            received.update(data)
-        except Exception:
-            pass
-
-    try:
-        client = (
-            mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-            if hasattr(mqtt, "CallbackAPIVersion")
-            else mqtt.Client()
-        )
-        client.on_message = on_message
-        client.connect(MQTT_BROKER, MQTT_PORT, 15)
-        client.subscribe(MQTT_TOPIC_TELEMETRY)
-        client.loop_start()
-
-        deadline = time.time() + timeout_sec
-        while time.time() < deadline and not received:
-            time.sleep(0.05)
-
-        client.loop_stop()
-        client.disconnect()
-    except Exception as exc:
-        print(f"[WARN] MQTT broker unreachable ({exc}). Using fallback suit telemetry.")
-
-    if received:
-        print(f"[WOKWI LIVE] Telemetry locked from {MQTT_TOPIC_TELEMETRY}: {json.dumps(received)}")
-        return received
-
-    print("[INFO] No live Wokwi packet detected within 3s window (is simulation running?). Using nominal telemetry.")
-    return DEFAULT_WOKWI_TELEMETRY.copy()
-
-
-def publish_hud_to_wokwi(summary_dict):
-    """Pushes the calculated A* route summary back to the Wokwi ESP32 Serial Monitor."""
-    if not HAS_MQTT:
-        return
-    try:
-        client = (
-            mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-            if hasattr(mqtt, "CallbackAPIVersion")
-            else mqtt.Client()
-        )
-        client.connect(MQTT_BROKER, MQTT_PORT, 10)
-        client.publish(MQTT_TOPIC_HUD_ACK, json.dumps(summary_dict))
-        client.disconnect()
-    except Exception:
-        pass
-
-
-wokwi_data = fetch_wokwi_telemetry(timeout_sec=3.0)
-
-
-# ==========================================
-# 2. NASA API FETCH & OFFLINE FALLBACKS
+# 1. NASA API FETCH & OFFLINE FALLBACKS
 # ==========================================
 def fetch_mars2020_bundle(sol_num):
     try:
@@ -190,113 +108,52 @@ def make_fallback_sci_image():
     return img
 
 
-navcam_urls, science_urls = [], []
 active_sol = START_SOL
-
-for current_sol in range(START_SOL, START_SOL - 8, -1):
-    n_urls, s_urls = fetch_mars2020_bundle(current_sol)
-    if n_urls and s_urls:
-        active_sol = current_sol
-        navcam_urls, science_urls = n_urls, s_urls
-        print(f"[INFO] NASA API: Found paired Navcam + Macro bundle on Sol {active_sol}.")
-        break
-
-if navcam_urls and science_urls:
-    nav_id, nav_url = navcam_urls[0]
-    sci_id, sci_url = science_urls[0]
-    try:
-        nav_img = Image.open(BytesIO(requests.get(nav_url, headers=HEADERS, timeout=6).content)).convert("RGB")
-        sci_img = Image.open(BytesIO(requests.get(sci_url, headers=HEADERS, timeout=6).content)).convert("RGB")
-    except Exception:
-        nav_img, sci_img = make_fallback_nav_image(), make_fallback_sci_image()
-        nav_id, sci_id = "FALLBACK_NAV", "FALLBACK_SCI"
-elif NAVCAM_PATH.exists() and SCIENCE_PATH.exists():
+if NAVCAM_PATH.exists() and SCIENCE_PATH.exists():
     nav_img = Image.open(NAVCAM_PATH).convert("RGB")
     sci_img = Image.open(SCIENCE_PATH).convert("RGB")
     nav_id, sci_id = "CACHED_NAV", "CACHED_SCI"
 else:
-    nav_img, sci_img = make_fallback_nav_image(), make_fallback_sci_image()
-    nav_id, sci_id = "FALLBACK_NAV", "FALLBACK_SCI"
-
-nav_img.save(NAVCAM_PATH)
-sci_img.save(SCIENCE_PATH)
-
-
-# ==========================================
-# 3. GALE CRATER COORDINATE & TARGET INPUT
-# ==========================================
-GALE_LAT_MIN, GALE_LAT_MAX = -4.65, -4.50
-GALE_LON_MIN, GALE_LON_MAX = 137.35, 137.50
-GRID_SIZE = 20
-CELL_SIZE_M = 5.0
-
-
-def latlon_to_grid(lat, lon):
-    lat_clamped = np.clip(lat, GALE_LAT_MIN, GALE_LAT_MAX)
-    lon_clamped = np.clip(lon, GALE_LON_MIN, GALE_LON_MAX)
-    row = int(round((GALE_LAT_MAX - lat_clamped) / (GALE_LAT_MAX - GALE_LAT_MIN) * (GRID_SIZE - 1)))
-    col = int(round((lon_clamped - GALE_LON_MIN) / (GALE_LON_MAX - GALE_LON_MIN) * (GRID_SIZE - 1)))
-    return int(np.clip(row, 0, GRID_SIZE - 1)), int(np.clip(col, 0, GRID_SIZE - 1))
-
-
-def grid_to_latlon(row, col):
-    lat = GALE_LAT_MAX - (row / (GRID_SIZE - 1)) * (GALE_LAT_MAX - GALE_LAT_MIN)
-    lon = GALE_LON_MIN + (col / (GRID_SIZE - 1)) * (GALE_LON_MAX - GALE_LON_MIN)
-    return round(float(lat), 4), round(float(lon), 4)
-
-
-start_pt = (17, 3)
-start_lat, start_lon = grid_to_latlon(*start_pt)
-
-PRESET_TARGETS = {
-    "1": ("Mount Sharp Smectite Clay Unit", (-4.515, 137.470), "Hydrated phyllosilicates (biosignature preservation)"),
-    "2": ("Vera Rubin Hematite Ridge",      (-4.525, 137.390), "Iron-oxide concretions (ancient redox boundary)"),
-    "3": ("Gediz Vallis Sulfate Channel",   (-4.580, 137.485), "Late-stage evaporative sulfates & boulder deposit"),
-}
-
-print(f"\n=== GALE CRATER EVA NAVIGATOR (Point A Visor Pos: {start_lat}, {start_lon} | Grid {start_pt}) ===")
-for k, (name, coords, _) in PRESET_TARGETS.items():
-    print(f"  [{k}] {name} -> Lat/Lon: {coords} (Grid {latlon_to_grid(*coords)})")
-print("  [4] Enter custom Gale Crater Grid (row,col) or Lat,Lon")
-
-if len(sys.argv) > 1:
-    user_choice = sys.argv[1].strip()
-else:
-    try:
-        user_choice = input("Choose [1/2/3/4] (or press Enter for default [1]): ").strip() or "1"
-    except EOFError:
-        user_choice = "1"
-
-if user_choice in PRESET_TARGETS:
-    target_name, (goal_lat, goal_lon), science_rationale = PRESET_TARGETS[user_choice]
-    goal_pt = latlon_to_grid(goal_lat, goal_lon)
-else:
-    raw_in = user_choice if "," in user_choice else ""
-    if not raw_in:
+    navcam_urls, science_urls = [], []
+    for current_sol in range(START_SOL, START_SOL - 6, -1):
+        n_urls, s_urls = fetch_mars2020_bundle(current_sol)
+        if n_urls and s_urls:
+            active_sol = current_sol
+            navcam_urls, science_urls = n_urls, s_urls
+            break
+    if navcam_urls and science_urls:
+        nav_id, nav_url = navcam_urls[0]
+        sci_id, sci_url = science_urls[0]
         try:
-            raw_in = input("Enter 'row,col' (0-19) OR 'lat,lon' (e.g. -4.52,137.46): ").strip()
-        except EOFError:
-            raw_in = ""
-    try:
-        v1, v2 = [float(x.strip()) for x in raw_in.split(",")]
-        if 0 <= v1 < GRID_SIZE and 0 <= v2 < GRID_SIZE:
-            goal_pt = (int(v1), int(v2))
-            goal_lat, goal_lon = grid_to_latlon(*goal_pt)
-            target_name = f"Custom Grid Target {goal_pt}"
-        else:
-            goal_pt = latlon_to_grid(v1, v2)
-            goal_lat, goal_lon = grid_to_latlon(*goal_pt)
-            target_name = f"Custom Gale Waypoint ({goal_lat}, {goal_lon})"
-        science_rationale = "User-designated geological sampling waypoint"
-    except Exception:
-        target_name, (goal_lat, goal_lon), science_rationale = PRESET_TARGETS["1"]
-        goal_pt = latlon_to_grid(goal_lat, goal_lon)
+            nav_img = Image.open(BytesIO(requests.get(nav_url, headers=HEADERS, timeout=6).content)).convert("RGB")
+            sci_img = Image.open(BytesIO(requests.get(sci_url, headers=HEADERS, timeout=6).content)).convert("RGB")
+        except Exception:
+            nav_img, sci_img = make_fallback_nav_image(), make_fallback_sci_image()
+            nav_id, sci_id = "FALLBACK_NAV", "FALLBACK_SCI"
+    else:
+        nav_img, sci_img = make_fallback_nav_image(), make_fallback_sci_image()
+        nav_id, sci_id = "FALLBACK_NAV", "FALLBACK_SCI"
+    nav_img.save(NAVCAM_PATH)
+    sci_img.save(SCIENCE_PATH)
+
+# Fetch Orbital Map Once
+lat_t, lon_t, zoom_t = -4.59, 137.44, 5
+tile_col = int((lon_t + 180.0) / 360.0 * (2 ** (zoom_t + 1)))
+tile_row = int((90.0 - lat_t) / 180.0 * (2 ** zoom_t))
+trek_url = (
+    f"https://trek.nasa.gov/tiles/Mars/EQ/Mars_MGS_MOLA_ClrShade_merge_global_463m/"
+    f"1.0.0/default/default028mm/{zoom_t}/{tile_row}/{tile_col}.jpg"
+)
+try:
+    orbital_map = np.array(Image.open(BytesIO(requests.get(trek_url, timeout=5).content)).convert("RGB"))
+except Exception:
+    orbital_map = np.full((256, 256, 3), 165, dtype=np.uint8)
 
 
 # ==========================================
-# 4. CV DEPTH + WOKWI 5-HAZARD FUSION
+# 2. PRECOMPUTE CV DEPTH & SCIENCE CONTOURS
 # ==========================================
-visor_rgb = np.array(Image.open(NAVCAM_PATH).convert("RGB"))
+visor_rgb = np.array(nav_img)
 h_img, w_img, _ = visor_rgb.shape
 
 if midas is not None and midas_transforms is not None:
@@ -323,75 +180,12 @@ hud_colormap = cv2.cvtColor(
 )
 ground_mask = np.zeros_like(visor_rgb, dtype=np.float32)
 ground_mask[int(h_img * 0.35):, :] = 0.45
-annotated_visor = np.clip(visor_rgb * (1.0 - ground_mask) + hud_colormap * ground_mask, 0, 255).astype(np.uint8)
+base_annotated_visor = np.clip(visor_rgb * (1.0 - ground_mask) + hud_colormap * ground_mask, 0, 255).astype(np.uint8)
+local_bev = cv2.resize(hazard_map_2d[int(h_img * 0.40):, :], (7, 8), interpolation=cv2.INTER_AREA)
 
-# Wokwi Hazard 4: Dust Storm Visibility lowers CV obstacle cutoff & tints visor
-vis_pct = float(wokwi_data.get("visibility_pct", 85.0))
-dust_hazard_active = bool(wokwi_data.get("dust_hazard", False))
-cv_risk_cutoff = 0.42 if dust_hazard_active else 0.55
-
-if dust_hazard_active:
-    dust_tint = np.full_like(annotated_visor, (215, 120, 45), dtype=np.uint8)
-    annotated_visor = cv2.addWeighted(annotated_visor, 0.72, dust_tint, 0.28, 0)
-
-cost_grid = np.ones((GRID_SIZE, GRID_SIZE), dtype=float)
-ground_crop = hazard_map_2d[int(h_img * 0.40):, :]
-local_bev = cv2.resize(ground_crop, (7, 8), interpolation=cv2.INTER_AREA)
-
-heading_vec = np.array([goal_pt[0] - start_pt[0], goal_pt[1] - start_pt[1]], dtype=float)
-heading_norm = np.linalg.norm(heading_vec)
-heading_vec = heading_vec / heading_norm if heading_norm > 0 else np.array([-1.0, 0.0])
-right_vec = np.array([heading_vec[1], -heading_vec[0]])
-
-# Wokwi Hazard 2: Perchlorate salts increase dust-kickup slope cost
-salt_pct = float(wokwi_data.get("perchlorate_pct", 0.10))
-salt_hazard_active = bool(wokwi_data.get("salt_hazard", False))
-slope_penalty_mult = 18.0 if salt_hazard_active else 12.0
-
-for d_step in range(1, 9):
-    for lat_idx, offset in enumerate(range(-3, 4)):
-        r = int(round(start_pt[0] + d_step * heading_vec[0] + offset * 0.7 * right_vec[0]))
-        c = int(round(start_pt[1] + d_step * heading_vec[1] + offset * 0.7 * right_vec[1]))
-        if 0 <= r < GRID_SIZE and 0 <= c < GRID_SIZE and (r, c) != start_pt:
-            cell_risk = float(local_bev[8 - d_step, lat_idx])
-            if cell_risk > cv_risk_cutoff:
-                cost_grid[r, c] = np.inf
-            else:
-                cost_grid[r, c] = max(cost_grid[r, c], 1.0 + slope_penalty_mult * cell_risk)
-
-num_cv_hazards = int(np.sum(cost_grid > 2.2))
-
-# Wokwi Hazard 1: Ionizing Radiation dynamically expands RAD Zone
-rad_msv = float(wokwi_data.get("radiation_msv_hr", 0.037))
-rad_hazard_active = bool(wokwi_data.get("rad_hazard", False))
-if rad_msv > 0.300:
-    RAD_ROWS, RAD_COLS = (3, 10), (9, 16)   # Severe radiation flare (7x7 cells)
-elif rad_hazard_active:
-    RAD_ROWS, RAD_COLS = (4, 9), (10, 15)   # Elevated radiation zone (5x5 cells)
-else:
-    RAD_ROWS, RAD_COLS = (5, 8), (11, 14)   # Baseline RAD pocket (3x3 cells)
-
-cost_grid[RAD_ROWS[0]:RAD_ROWS[1], RAD_COLS[0]:RAD_COLS[1]] = np.inf
-
-# Wokwi Hazard 2 (cont.): High perchlorate concentration marks toxic salt basin
-SALT_ROWS, SALT_COLS = (11, 14), (6, 9)
-if salt_hazard_active:
-    cost_grid[SALT_ROWS[0]:SALT_ROWS[1], SALT_COLS[0]:SALT_COLS[1]] = np.inf
-
-cost_grid[start_pt] = 1.0
-
-if np.isinf(cost_grid[goal_pt]):
-    safe_cells = np.argwhere(~np.isinf(cost_grid))
-    dists = np.linalg.norm(safe_cells - np.array(goal_pt), axis=1)
-    nearest_safe = tuple(map(int, safe_cells[np.argmin(dists)]))
-    print(f"[ALERT] Point B {goal_pt} is inside an active hazard zone! Auto-snapped to {nearest_safe}.")
-    goal_pt = nearest_safe
-    goal_lat, goal_lon = grid_to_latlon(*goal_pt)
-
-# Micro-Science CV Grain/Vein Inspector
-sci_rgb = np.array(Image.open(SCIENCE_PATH).convert("RGB"))
-sci_gray = cv2.cvtColor(sci_rgb, cv2.COLOR_RGB2GRAY)
-sci_edges = cv2.Canny(cv2.GaussianBlur(sci_gray, (5, 5), 0), 45, 130)
+# Science macro contours
+sci_rgb = np.array(sci_img)
+sci_edges = cv2.Canny(cv2.GaussianBlur(cv2.cvtColor(sci_rgb, cv2.COLOR_RGB2GRAY), (5, 5), 0), 45, 130)
 contours, _ = cv2.findContours(sci_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 annotated_science = sci_rgb.copy()
 cv2.drawContours(annotated_science, contours, -1, (0, 255, 180), 1)
@@ -399,8 +193,82 @@ mineral_feature_count = len([cnt for cnt in contours if cv2.contourArea(cnt) > 1
 
 
 # ==========================================
-# 5. WEIGHTED A* + TURN-BY-TURN GENERATOR
+# 3. COORDINATE GRID & TARGET DEFINITIONS
 # ==========================================
+GALE_LAT_MIN, GALE_LAT_MAX = -4.65, -4.50
+GALE_LON_MIN, GALE_LON_MAX = 137.35, 137.50
+GRID_SIZE = 20
+CELL_SIZE_M = 5.0
+
+
+def latlon_to_grid(lat, lon):
+    lat_c = np.clip(lat, GALE_LAT_MIN, GALE_LAT_MAX)
+    lon_c = np.clip(lon, GALE_LON_MIN, GALE_LON_MAX)
+    row = int(round((GALE_LAT_MAX - lat_c) / (GALE_LAT_MAX - GALE_LAT_MIN) * (GRID_SIZE - 1)))
+    col = int(round((lon_c - GALE_LON_MIN) / (GALE_LON_MAX - GALE_LON_MIN) * (GRID_SIZE - 1)))
+    return int(np.clip(row, 0, GRID_SIZE - 1)), int(np.clip(col, 0, GRID_SIZE - 1))
+
+
+def grid_to_latlon(row, col):
+    lat = GALE_LAT_MAX - (row / (GRID_SIZE - 1)) * (GALE_LAT_MAX - GALE_LAT_MIN)
+    lon = GALE_LON_MIN + (col / (GRID_SIZE - 1)) * (GALE_LON_MAX - GALE_LON_MIN)
+    return round(float(lat), 4), round(float(lon), 4)
+
+
+start_pt = (17, 3)
+start_lat, start_lon = grid_to_latlon(*start_pt)
+
+PRESET_TARGETS = {
+    "1": ("Mount Sharp Smectite Clay Unit", (-4.515, 137.470), "Hydrated phyllosilicates (biosignature preservation)"),
+    "2": ("Vera Rubin Hematite Ridge",      (-4.525, 137.390), "Iron-oxide concretions (ancient redox boundary)"),
+    "3": ("Gediz Vallis Sulfate Channel",   (-4.580, 137.485), "Late-stage evaporative sulfates & boulder deposit"),
+}
+
+print(f"\n=== GALE CRATER EVA NAVIGATOR (Point A Visor Pos: {start_lat}, {start_lon} | Grid {start_pt}) ===")
+for k, (name, coords, _) in PRESET_TARGETS.items():
+    print(f"  [{k}] {name} -> Lat/Lon: {coords} (Grid {latlon_to_grid(*coords)})")
+
+if len(sys.argv) > 1:
+    user_choice = sys.argv[1].strip()
+else:
+    try:
+        user_choice = input("Choose Target [1/2/3] (or press Enter for [3] Gediz Vallis): ").strip() or "3"
+    except EOFError:
+        user_choice = "3"
+
+if user_choice not in PRESET_TARGETS:
+    user_choice = "3"
+
+
+# ==========================================
+# 4. DYNAMIC 5-HAZARD SPATIAL MAP & A* ENGINE
+# ==========================================
+STATE = {
+    "target_key": user_choice,
+    "telemetry": {
+        "source": "DEFAULT_NOMINAL (Press R/S/D/T/A or adjust Wokwi)",
+        "radiation_msv_hr": 0.035,
+        "perchlorate_pct": 0.10,
+        "suit_kpa": 32.1,
+        "visibility_pct": 85.0,
+        "temp_c": -10.0,
+        "rad_hazard": False,     # OFF by default -> NO Red Zone!
+        "salt_hazard": False,    # OFF by default -> NO Purple Zone!
+        "atmo_hazard": False,
+        "dust_hazard": False,
+        "temp_hazard": False,
+    },
+    "needs_redraw": True,
+}
+
+DIRECTION_MAP = {
+    (-1,  0): ("N",  "000°"), (-1,  1): ("NE", "045°"),
+    ( 0,  1): ("E",  "090°"), ( 1,  1): ("SE", "135°"),
+    ( 1,  0): ("S",  "180°"), ( 1, -1): ("SW", "225°"),
+    ( 0, -1): ("W",  "270°"), (-1, -1): ("NW", "315°"),
+}
+
+
 def weighted_astar(grid, start, goal):
     open_set = [(0.0, start)]
     came_from = {}
@@ -436,55 +304,170 @@ def weighted_astar(grid, start, goal):
     return []
 
 
-DIRECTION_MAP = {
-    (-1,  0): ("N",  "000°"), (-1,  1): ("NE", "045°"),
-    ( 0,  1): ("E",  "090°"), ( 1,  1): ("SE", "135°"),
-    ( 1,  0): ("S",  "180°"), ( 1, -1): ("SW", "225°"),
-    ( 0, -1): ("W",  "270°"), (-1, -1): ("NW", "315°"),
-}
+def stamp_circular_hazard(cost_grid, hazard_layer, center_rc, radius, label_code, cost_val=np.inf):
+    """Stamps a circular spatial hazard onto the grid so A* must curve around it."""
+    cr, cc = center_rc
+    stamped = []
+    for r in range(GRID_SIZE):
+        for c in range(GRID_SIZE):
+            if np.hypot(r - cr, c - cc) <= radius:
+                cost_grid[r, c] = cost_val
+                hazard_layer[r, c] = label_code
+                stamped.append((r, c))
+    return stamped
 
 
-def check_adjacent_hazards(r, c, grid):
-    alerts = set()
-    for dr in (-1, 0, 1):
-        for dc in (-1, 0, 1):
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < grid.shape[0] and 0 <= nc < grid.shape[1]:
-                if np.isinf(grid[nr, nc]):
-                    if RAD_ROWS[0] <= nr < RAD_ROWS[1] and RAD_COLS[0] <= nc < RAD_COLS[1]:
-                        alerts.add(f"Radiation Zone ({rad_msv:.3f} mSv/h)")
-                    elif salt_hazard_active and SALT_ROWS[0] <= nr < SALT_ROWS[1] and SALT_COLS[0] <= nc < SALT_COLS[1]:
-                        alerts.add(f"Toxic Perchlorate Basin ({salt_pct:.2f}%)")
-                    else:
-                        alerts.add("Visor-Detected Steep Boulder")
-                elif grid[nr, nc] > 2.2:
-                    alerts.add("Rough Regolith Slope")
-    return sorted(alerts)
+def build_dynamic_environment():
+    """Constructs the 20x20 cost grid and spatial hazard zones from current Wokwi telemetry."""
+    tel = STATE["telemetry"]
+    t_name, (g_lat, g_lon), sci_rat = PRESET_TARGETS[STATE["target_key"]]
+    base_goal_pt = latlon_to_grid(g_lat, g_lon)
+
+    rad_msv = float(tel.get("radiation_msv_hr", 0.035))
+    rad_haz = bool(tel.get("rad_hazard", rad_msv > 0.100))
+
+    salt_pct = float(tel.get("perchlorate_pct", 0.10))
+    salt_haz = bool(tel.get("salt_hazard", salt_pct > 0.60))
+
+    suit_kpa = float(tel.get("suit_kpa", 32.1))
+    atmo_haz = bool(tel.get("atmo_hazard", suit_kpa < 25.0))
+
+    vis_pct = float(tel.get("visibility_pct", 85.0))
+    dust_haz = bool(tel.get("dust_hazard", vis_pct < 35.0))
+
+    temp_c = float(tel.get("temp_c", -10.0))
+    temp_haz = bool(tel.get("temp_hazard", temp_c < -25.0 or temp_c > 35.0))
+
+    cost_grid = np.ones((GRID_SIZE, GRID_SIZE), dtype=float)
+    # hazard_layer codes: 0=None, 1=CV_Boulder, 2=CV_Slope, 3=RAD, 4=SALT, 5=DUST, 6=TEMP
+    hazard_layer = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
+    zone_centers = {}
+
+    # 1. Project foreground CV hazards along heading vector
+    vec = np.array([base_goal_pt[0] - start_pt[0], base_goal_pt[1] - start_pt[1]], dtype=float)
+    norm = np.linalg.norm(vec)
+    unit_vec = vec / norm if norm > 0 else np.array([-1.0, 0.0])
+    right_vec = np.array([unit_vec[1], -unit_vec[0]])
+
+    cv_cutoff = 0.40 if dust_haz else 0.55
+    slope_mult = 16.0 if (salt_haz or atmo_haz) else 11.0
+
+    for d_step in range(1, 8):
+        for lat_idx, offset in enumerate(range(-3, 4)):
+            r = int(round(start_pt[0] + d_step * unit_vec[0] + offset * 0.7 * right_vec[0]))
+            c = int(round(start_pt[1] + d_step * unit_vec[1] + offset * 0.7 * right_vec[1]))
+            if 0 <= r < GRID_SIZE and 0 <= c < GRID_SIZE and (r, c) != start_pt:
+                cell_risk = float(local_bev[8 - d_step, lat_idx])
+                if cell_risk > cv_cutoff:
+                    cost_grid[r, c] = np.inf
+                    hazard_layer[r, c] = 1
+                elif cell_risk > 0.12:
+                    cost_grid[r, c] = 1.0 + slope_mult * cell_risk
+                    if cost_grid[r, c] > 2.2:
+                        hazard_layer[r, c] = 2
+
+    # Suit Pressure Leak (atmo_hazard): Astronaut cannot climb rough slopes!
+    if atmo_haz:
+        steep_mask = (cost_grid > 2.0) & (~np.isinf(cost_grid))
+        cost_grid[steep_mask] = np.inf
+        hazard_layer[steep_mask] = 1
+
+    # 2. Wokwi Hazard 1: RADIATION ZONE (ONLY active when rad_hazard is True!)
+    if rad_haz:
+        # Placed 38% along the direct path from Point A to Point B so A* MUST reroute around it!
+        rad_center = (
+            int(round(start_pt[0] + 0.38 * vec[0])),
+            int(round(start_pt[1] + 0.38 * vec[1])),
+        )
+        # Radius grows dynamically from 1.8 cells (at 0.11 mSv/h) to 3.4 cells (at 0.50 mSv/h)
+        rad_radius = 1.6 + np.clip((rad_msv - 0.10) / 0.40, 0.0, 1.0) * 1.8
+        stamp_circular_hazard(cost_grid, hazard_layer, rad_center, rad_radius, label_code=3, cost_val=np.inf)
+        zone_centers["RAD ZONE"] = (rad_center, "white", "red")
+
+    # 3. Wokwi Hazard 2: PERCHLORATE SALT BASIN (ONLY active when salt_hazard is True!)
+    if salt_haz:
+        # Placed 68% along the direct path + slightly offset so it creates a second S-bend
+        salt_center = (
+            int(round(start_pt[0] + 0.68 * vec[0] + 1.2 * right_vec[0])),
+            int(round(start_pt[1] + 0.68 * vec[1] + 1.2 * right_vec[1])),
+        )
+        salt_radius = 1.5 + np.clip((salt_pct - 0.60) / 1.40, 0.0, 1.0) * 1.5
+        stamp_circular_hazard(cost_grid, hazard_layer, salt_center, salt_radius, label_code=4, cost_val=np.inf)
+        zone_centers["PERCHLORATE"] = (salt_center, "white", "purple")
+
+    # 4. Wokwi Hazard 4: DUST STORM SQUALL WALL (ONLY active when dust_hazard is True!)
+    if dust_haz:
+        dust_center = (
+            int(round(start_pt[0] + 0.52 * vec[0] - 1.8 * right_vec[0])),
+            int(round(start_pt[1] + 0.52 * vec[1] - 1.8 * right_vec[1])),
+        )
+        dust_radius = 1.6 + np.clip((35.0 - vis_pct) / 35.0, 0.0, 1.0) * 1.4
+        stamp_circular_hazard(cost_grid, hazard_layer, dust_center, dust_radius, label_code=5, cost_val=np.inf)
+        zone_centers["DUST SQUALL"] = (dust_center, "black", "sandybrown")
+
+    # 5. Wokwi Hazard 5: EXTREME TEMP ZONE (ONLY active when temp_hazard is True!)
+    if temp_haz:
+        temp_center = (
+            int(round(start_pt[0] + 0.25 * vec[0] - 2.2 * right_vec[0])),
+            int(round(start_pt[1] + 0.25 * vec[1] - 2.2 * right_vec[1])),
+        )
+        temp_label = "CRYO TRAP" if temp_c < -25.0 else "HEAT TRAP"
+        temp_bg = "deepskyblue" if temp_c < -25.0 else "deeppink"
+        stamp_circular_hazard(cost_grid, hazard_layer, temp_center, 1.8, label_code=6, cost_val=np.inf)
+        zone_centers[temp_label] = (temp_center, "white", temp_bg)
+
+    # Guarantee Start & Goal are walkable
+    cost_grid[start_pt] = 1.0
+    hazard_layer[start_pt] = 0
+
+    goal_pt = base_goal_pt
+    if np.isinf(cost_grid[goal_pt]):
+        safe_cells = np.argwhere(~np.isinf(cost_grid))
+        dists = np.linalg.norm(safe_cells - np.array(goal_pt), axis=1)
+        goal_pt = tuple(map(int, safe_cells[np.argmin(dists)]))
+
+    safe_path = weighted_astar(cost_grid, start_pt, goal_pt)
+    return cost_grid, hazard_layer, zone_centers, goal_pt, safe_path
 
 
-def generate_eva_instructions(path, grid, cell_m=5.0):
+def generate_eva_instructions(path, cost_grid, hazard_layer, goal_pt):
+    t_name, _, _ = PRESET_TARGETS[STATE["target_key"]]
+    goal_lat, goal_lon = grid_to_latlon(*goal_pt)
     if len(path) < 2:
-        return ["HOLD POSITION: Target unreachable or already at destination."], 0.0
+        return ["HOLD POSITION: All corridors blocked by extreme hazards!"], 0.0
+
+    LABEL_NAMES = {
+        1: "Visor Steep Boulder",
+        3: "Radiation Plume",
+        4: "Toxic Perchlorate Basin",
+        5: "Dust Storm Squall",
+        6: "Extreme Thermal Zone",
+    }
 
     segments = []
     for i in range(len(path) - 1):
         r1, c1 = path[i]
         r2, c2 = path[i + 1]
         vec = (r2 - r1, c2 - c1)
-        step_m = float(np.hypot(vec[0], vec[1]) * cell_m)
-        hazards = check_adjacent_hazards(r2, c2, grid)
-        terrain_cost = float(grid[r2, c2])
+        step_m = float(np.hypot(vec[0], vec[1]) * CELL_SIZE_M)
+
+        nearby = set()
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                nr, nc = r2 + dr, c2 + dc
+                if 0 <= nr < GRID_SIZE and 0 <= nc < GRID_SIZE:
+                    code = int(hazard_layer[nr, nc])
+                    if code in LABEL_NAMES:
+                        nearby.add(LABEL_NAMES[code])
 
         if segments and segments[-1]["vec"] == vec:
             segments[-1]["end_cell"] = (r2, c2)
             segments[-1]["dist_m"] += step_m
             segments[-1]["steps"] += 1
-            segments[-1]["max_cost"] = max(segments[-1]["max_cost"], terrain_cost)
-            segments[-1]["hazards"].update(hazards)
+            segments[-1]["hazards"].update(nearby)
         else:
             segments.append({
-                "vec": vec, "start_cell": (r1, c1), "end_cell": (r2, c2),
-                "dist_m": step_m, "steps": 1, "max_cost": terrain_cost, "hazards": set(hazards),
+                "vec": vec, "end_cell": (r2, c2), "dist_m": step_m, "steps": 1, "hazards": set(nearby)
             })
 
     instructions = []
@@ -494,154 +477,273 @@ def generate_eva_instructions(path, grid, cell_m=5.0):
         dist = round(seg["dist_m"], 1)
         total_dist_m += seg["dist_m"]
         end_lat, end_lon = grid_to_latlon(*seg["end_cell"])
-
         action = "Start EVA: Walk" if idx == 1 else "Turn & walk"
-        surface_note = "Rough slope (slow pace)" if seg["max_cost"] > 2.2 else "Flat regolith (nominal)"
-        hazard_note = f" | CAUTION: Bypassing {', '.join(sorted(seg['hazards']))}" if seg["hazards"] else ""
-
+        haz_str = f" | AVOIDING: {', '.join(sorted(seg['hazards']))}" if seg["hazards"] else ""
         instructions.append(
-            f"LEG {idx}: {action} {compass} ({deg}) for {dist} m ({seg['steps']} steps) "
-            f"to {seg['end_cell']} [{end_lat}, {end_lon}] — {surface_note}{hazard_note}"
+            f"LEG {idx}: {action} {compass} ({deg}) for {dist} m to {seg['end_cell']} [{end_lat}, {end_lon}]{haz_str}"
         )
 
-    # Append dynamic Wokwi suit advisories
-    suit_alerts = []
-    if bool(wokwi_data.get("atmo_hazard", False)):
-        suit_alerts.append(f"SUIT PRESSURE DROP ({wokwi_data.get('suit_kpa', 0):.1f} kPa - check CO2 seal)")
-    if salt_hazard_active:
-        suit_alerts.append(f"PERCHLORATE DUST ({salt_pct:.2f}% - airlock decon required)")
-    if dust_hazard_active:
-        suit_alerts.append(f"LOW VISIBILITY ({vis_pct:.1f}% - HUD contrast boost active)")
-    if bool(wokwi_data.get("temp_hazard", False)):
-        suit_alerts.append(f"EXTREME TEMP ({wokwi_data.get('temp_c', -10.0):.1f} C - PLSS thermal regulation max)")
-
-    if suit_alerts:
-        instructions.append("WOKWI SUIT ALERTS: " + " | ".join(suit_alerts))
-
-    instructions.append(
-        f"ARRIVAL: Reached Point B ({target_name}) at Grid {path[-1]} [{goal_lat}, {goal_lon}]. "
-        f"({mineral_feature_count} micro-structures flagged)."
-    )
+    instructions.append(f"ARRIVAL: Point B ({t_name}) at Grid {goal_pt} [{goal_lat}, {goal_lon}].")
     return instructions, round(total_dist_m, 1)
 
 
-safe_path = weighted_astar(cost_grid, start_pt, goal_pt)
-eva_instructions, total_distance_m = generate_eva_instructions(safe_path, cost_grid, CELL_SIZE_M)
+# ==========================================
+# 5. LIVE MATPLOTLIB DASHBOARD & KEYBOARD UI
+# ==========================================
+fig, axes = plt.subplots(1, 3, figsize=(18, 6.6))
 
-# Wokwi Hazard 3 & 5: Adjust Walk Speed (Temp/Dust) & O2 Burn (Suit Pressure Leak)
-temp_hazard_active = bool(wokwi_data.get("temp_hazard", False))
-suit_kpa = float(wokwi_data.get("suit_kpa", 32.1))
-atmo_hazard_active = bool(wokwi_data.get("atmo_hazard", False))
 
-walk_speed_mps = 0.55 if (temp_hazard_active or dust_hazard_active) else 0.80
-leak_multiplier = 1.0 + max(0.0, (28.0 - suit_kpa) * 0.08) if atmo_hazard_active else 1.0
+def update_dashboard():
+    tel = STATE["telemetry"]
+    t_name, _, sci_rat = PRESET_TARGETS[STATE["target_key"]]
+    cost_grid, hazard_layer, zone_centers, goal_pt, safe_path = build_dynamic_environment()
+    eva_instructions, total_distance_m = generate_eva_instructions(safe_path, cost_grid, hazard_layer, goal_pt)
 
-est_walk_time_min = round((total_distance_m / walk_speed_mps) / 60.0, 1)
-est_o2_used_pct = round(total_distance_m * 0.025 * leak_multiplier, 2)
+    rad_msv = float(tel.get("radiation_msv_hr", 0.035))
+    salt_pct = float(tel.get("perchlorate_pct", 0.10))
+    suit_kpa = float(tel.get("suit_kpa", 32.1))
+    vis_pct = float(tel.get("visibility_pct", 85.0))
+    temp_c = float(tel.get("temp_c", -10.0))
+
+    dust_haz = bool(tel.get("dust_hazard", vis_pct < 35.0))
+    temp_haz = bool(tel.get("temp_hazard", temp_c < -25.0 or temp_c > 35.0))
+    atmo_haz = bool(tel.get("atmo_hazard", suit_kpa < 25.0))
+
+    walk_speed = 0.55 if (temp_haz or dust_haz) else 0.80
+    leak_mult = 1.0 + max(0.0, (26.0 - suit_kpa) * 0.09) if atmo_haz else 1.0
+    est_time_min = round((total_distance_m / walk_speed) / 60.0, 1)
+    est_o2_pct = round(total_distance_m * 0.025 * leak_mult, 2)
+
+    active_flags = [
+        name for name, flag in [
+            ("RADIATION", bool(tel.get("rad_hazard", rad_msv > 0.100))),
+            ("PERCHLORATE", bool(tel.get("salt_hazard", salt_pct > 0.60))),
+            ("SUIT LEAK", atmo_haz),
+            ("DUST STORM", dust_haz),
+            ("EXTREME TEMP", temp_haz),
+        ] if flag
+    ]
+    status_str = ", ".join(active_flags) if active_flags else "ALL NOMINAL (CLEAR CORRIDOR)"
+
+    # Console output
+    print("\n" + "=" * 92)
+    print(f"LIVE EVA ROUTER [{tel.get('source')}] | Active Hazards: {status_str}")
+    print(f"Target: {t_name} {goal_pt} | Dist: {total_distance_m} m | Time: {est_time_min} min | O2: {est_o2_pct}%")
+    for line in eva_instructions:
+        print("  • " + line)
+    print("=" * 92)
+
+    # Clear axes and redraw cleanly without overlapping titles
+    for ax in axes:
+        ax.clear()
+
+    fig.suptitle(
+        f"Wokwi Suit Telemetry [{tel.get('source')}]  |  Active Alerts: {status_str}\n"
+        f"RAD: {rad_msv:.3f} mSv/h  •  Salt: {salt_pct:.2f}%  •  Suit: {suit_kpa:.1f} kPa  •  "
+        f"Vis: {vis_pct:.0f}%  •  Temp: {temp_c:.1f}°C",
+        fontsize=11, fontweight="bold", y=0.97
+    )
+
+    # Panel 1: Visor HUD (Tints amber during a Dust Storm)
+    visor_img = base_annotated_visor.copy()
+    if dust_haz:
+        amber = np.full_like(visor_img, (215, 115, 35), dtype=np.uint8)
+        visor_img = cv2.addWeighted(visor_img, 0.65, amber, 0.35, 0)
+    num_cv_cells = int(np.sum((hazard_layer == 1) | (hazard_layer == 2)))
+    axes[0].imshow(visor_img)
+    axes[0].set_title(
+        f"1. Point A Visor HUD ({nav_id})\n{num_cv_cells} CV Rock/Slope Cells | Vis: {vis_pct:.0f}%",
+        fontsize=10, pad=8
+    )
+    axes[0].axis("off")
+
+    # Panel 2: Dynamic Gale Crater Map
+    h, w, _ = orbital_map.shape
+    cell_h, cell_w = h / GRID_SIZE, w / GRID_SIZE
+    axes[1].imshow(orbital_map)
+
+    COLOR_MAP = {
+        1: ("darkorange", 0.55),  # CV Impassable Boulder
+        2: ("gold",       0.32),  # CV Rough Slope
+        3: ("red",        0.65),  # Wokwi Radiation Plume
+        4: ("purple",     0.65),  # Wokwi Perchlorate Salt Basin
+        5: ("sandybrown", 0.65),  # Wokwi Dust Storm Squall
+        6: ("deepskyblue" if temp_c < 0 else "deeppink", 0.65),  # Wokwi Extreme Temp
+    }
+
+    for r in range(GRID_SIZE):
+        for c in range(GRID_SIZE):
+            code = int(hazard_layer[r, c])
+            if code in COLOR_MAP:
+                col_name, alpha_val = COLOR_MAP[code]
+                axes[1].add_patch(
+                    plt.Rectangle((c * cell_w, r * cell_h), cell_w, cell_h, color=col_name, alpha=alpha_val)
+                )
+
+    for label_txt, ((cr, cc), fg_col, bg_col) in zone_centers.items():
+        axes[1].text(
+            (cc + 0.5) * cell_w, (cr + 0.5) * cell_h, label_txt,
+            color=fg_col, fontsize=7.5, fontweight="bold", ha="center", va="center",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor=bg_col, alpha=0.85, edgecolor="white")
+        )
+
+    if safe_path:
+        py = [(r + 0.5) * cell_h for r, _ in safe_path]
+        px = [(c + 0.5) * cell_w for _, c in safe_path]
+        axes[1].plot(px, py, color="lime", linewidth=3.2, label=f"Safe A* Path ({total_distance_m} m)")
+
+    axes[1].scatter([(start_pt[1] + 0.5) * cell_w], [(start_pt[0] + 0.5) * cell_h], color="cyan", s=110, zorder=5, label=f"Point A {start_pt}")
+    axes[1].scatter([(goal_pt[1] + 0.5) * cell_w], [(goal_pt[0] + 0.5) * cell_h], color="yellow", marker="*", s=220, zorder=5, label=f"Point B {goal_pt}")
+    axes[1].set_title(
+        f"2. Gale Crater Route: {t_name}\nDist: {total_distance_m} m | Time: {est_time_min} min | Est. O2: {est_o2_pct}%",
+        fontsize=10, pad=8
+    )
+    axes[1].legend(loc="lower left", fontsize=8)
+    axes[1].axis("off")
+
+    # Panel 3: Micro-Science Inspector
+    axes[2].imshow(annotated_science)
+    axes[2].set_title(
+        f"3. Point B Science Macro ({sci_id})\n{mineral_feature_count} Grain Boundaries | {sci_rat[:34]}...",
+        fontsize=10, pad=8
+    )
+    axes[2].axis("off")
+
+    fig.subplots_adjust(top=0.82, bottom=0.08, left=0.02, right=0.98, wspace=0.08)
+    plt.savefig(ROUTE_PLOT_PATH, dpi=150)
+    fig.canvas.draw_idle()
+
+    # Export updated JSON for Java UI
+    with open(JSON_OUT_PATH, "w", encoding="utf-8") as f:
+        json.dump({
+            "wokwi_suit_telemetry": tel,
+            "active_hazards": active_flags,
+            "point_a_visor_start": {"grid": list(start_pt)},
+            "point_b_target": {"name": t_name, "grid": list(goal_pt)},
+            "route_metrics": {
+                "total_distance_m": total_distance_m,
+                "estimated_walk_time_min": est_time_min,
+                "estimated_o2_cost_pct": est_o2_pct,
+            },
+            "turn_by_turn_instructions": eva_instructions,
+        }, f, indent=2)
+
+
+def on_key_press(event):
+    """Interactive keyboard controls so you can toggle any hazard live in the Figure window."""
+    if not event.key:
+        return
+    k = event.key.lower()
+    tel = STATE["telemetry"]
+
+    if k in ("1", "2", "3"):
+        STATE["target_key"] = k
+        tel["source"] = f"KEYBOARD_TARGET_{k}"
+    elif k == "r":
+        # Cycle Radiation: OFF -> MODERATE (0.18) -> SEVERE (0.45) -> OFF
+        if not tel["rad_hazard"]:
+            tel["radiation_msv_hr"], tel["rad_hazard"] = 0.180, True
+        elif tel["radiation_msv_hr"] < 0.35:
+            tel["radiation_msv_hr"], tel["rad_hazard"] = 0.450, True
+        else:
+            tel["radiation_msv_hr"], tel["rad_hazard"] = 0.030, False
+        tel["source"] = "KEYBOARD_OVERRIDE (RAD)"
+    elif k == "s":
+        tel["salt_hazard"] = not tel["salt_hazard"]
+        tel["perchlorate_pct"] = 1.45 if tel["salt_hazard"] else 0.10
+        tel["source"] = "KEYBOARD_OVERRIDE (SALT)"
+    elif k == "d":
+        tel["dust_hazard"] = not tel["dust_hazard"]
+        tel["visibility_pct"] = 18.0 if tel["dust_hazard"] else 85.0
+        tel["source"] = "KEYBOARD_OVERRIDE (DUST)"
+    elif k == "t":
+        if not tel["temp_hazard"]:
+            tel["temp_c"], tel["temp_hazard"] = -38.0, True
+        elif tel["temp_c"] < 0:
+            tel["temp_c"], tel["temp_hazard"] = 46.0, True
+        else:
+            tel["temp_c"], tel["temp_hazard"] = -10.0, False
+        tel["source"] = "KEYBOARD_OVERRIDE (TEMP)"
+    elif k == "a":
+        tel["atmo_hazard"] = not tel["atmo_hazard"]
+        tel["suit_kpa"] = 19.5 if tel["atmo_hazard"] else 32.1
+        tel["source"] = "KEYBOARD_OVERRIDE (SUIT_KPA)"
+    elif k == "c":
+        tel.update({
+            "source": "ALL_NOMINAL_RESET",
+            "radiation_msv_hr": 0.030, "rad_hazard": False,
+            "perchlorate_pct": 0.10,   "salt_hazard": False,
+            "suit_kpa": 32.1,          "atmo_hazard": False,
+            "visibility_pct": 85.0,    "dust_hazard": False,
+            "temp_c": -10.0,           "temp_hazard": False,
+        })
+    else:
+        return
+
+    update_dashboard()
+
+
+fig.text(
+    0.5, 0.015,
+    "LIVE CONTROLS — Wokwi MQTT Auto-Sync Active  |  Keyboard Shortcuts:  "
+    "[R] Radiation (Off/Med/High)   [S] Perchlorate Salt   [D] Dust Storm   "
+    "[T] Temp (Cryo/Hot)   [A] Suit Leak   [1/2/3] Switch Target   [C] Clear All Hazards",
+    ha="center", va="bottom", fontsize=9.5, fontweight="bold",
+    bbox=dict(boxstyle="round,pad=0.35", facecolor="#f0f4f8", edgecolor="#8899a6")
+)
+fig.canvas.mpl_connect("key_press_event", on_key_press)
 
 
 # ==========================================
-# 6. PRINT HUD, PUBLISH TO WOKWI & PLOT
+# 6. BACKGROUND LIVE WOKWI MQTT LISTENER
 # ==========================================
-print("\n" + "=" * 90)
-print(f"OFFLINE VISOR HUD + WOKWI TELEMETRY ({wokwi_data.get('source')}): {start_pt} -> {goal_pt}")
-print(
-    f"Target: {target_name} | Dist: {total_distance_m} m | "
-    f"Time: {est_walk_time_min} min | Est. O2: {est_o2_used_pct}%"
-)
-print(
-    f"Wokwi Sensors -> RAD: {rad_msv:.3f} mSv/h | Perchlorate: {salt_pct:.2f}% | "
-    f"Suit: {suit_kpa:.1f} kPa | Vis: {vis_pct:.1f}% | Temp: {float(wokwi_data.get('temp_c', -10.0)):.1f} C"
-)
-print("=" * 90)
-for step_text in eva_instructions:
-    print("  • " + step_text)
-print("=" * 90 + "\n")
+mqtt_client = None
+if HAS_MQTT:
+    def on_mqtt_msg(_client, _userdata, msg):
+        try:
+            incoming = json.loads(msg.payload.decode("utf-8"))
+            incoming["source"] = "LIVE_WOKWI_ESP32"
+            # Only trigger redraw if a hazard state or value meaningfully changed
+            old = STATE["telemetry"]
+            changed = any(
+                old.get(k) != incoming.get(k)
+                for k in ("rad_hazard", "salt_hazard", "atmo_hazard", "dust_hazard", "temp_hazard")
+            ) or abs(float(old.get("radiation_msv_hr", 0)) - float(incoming.get("radiation_msv_hr", 0))) > 0.02
+            STATE["telemetry"].update(incoming)
+            if changed or old.get("source") != "LIVE_WOKWI_ESP32":
+                STATE["needs_redraw"] = True
+        except Exception:
+            pass
 
-# Send calculated route back to Wokwi ESP32 Serial Monitor
-publish_hud_to_wokwi({
-    "target": target_name[:24],
-    "dist_m": total_distance_m,
-    "time_min": est_walk_time_min,
-    "o2_pct": est_o2_used_pct,
-    "first_leg": eva_instructions[0][:60] if eva_instructions else "HOLD",
-})
+    try:
+        mqtt_client = (
+            mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+            if hasattr(mqtt, "CallbackAPIVersion")
+            else mqtt.Client()
+        )
+        mqtt_client.on_message = on_mqtt_msg
+        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 15)
+        mqtt_client.subscribe(MQTT_TOPIC_TELEMETRY)
+        mqtt_client.loop_start()
+        print(f"[MQTT] Listening continuously to {MQTT_TOPIC_TELEMETRY} for live Wokwi knob changes...")
+    except Exception as e:
+        print(f"[WARN] Live MQTT listener offline ({e}). Use keyboard keys [R/S/D/T/A] in Figure window.")
 
-lat, lon, zoom = -4.59, 137.44, 5
-tile_col = int((lon + 180.0) / 360.0 * (2 ** (zoom + 1)))
-tile_row = int((90.0 - lat) / 180.0 * (2 ** zoom))
-trek_url = (
-    f"https://trek.nasa.gov/tiles/Mars/EQ/Mars_MGS_MOLA_ClrShade_merge_global_463m/"
-    f"1.0.0/default/default028mm/{zoom}/{tile_row}/{tile_col}.jpg"
-)
-try:
-    orbital_map = np.array(Image.open(BytesIO(requests.get(trek_url, timeout=6).content)).convert("RGB"))
-except Exception:
-    orbital_map = np.full((256, 256, 3), 165, dtype=np.uint8)
 
-fig, axes = plt.subplots(1, 3, figsize=(18, 6.2))
-fig.suptitle(
-    f"Wokwi Suit Telemetry [{wokwi_data.get('source')}] — "
-    f"RAD: {rad_msv:.3f} mSv/h | Salt: {salt_pct:.2f}% | Suit: {suit_kpa:.1f} kPa | "
-    f"Vis: {vis_pct:.1f}% | Temp: {float(wokwi_data.get('temp_c', -10.0)):.1f}°C",
-    fontsize=11, fontweight="bold"
-)
+def check_mqtt_timer():
+    if STATE["needs_redraw"]:
+        STATE["needs_redraw"] = False
+        update_dashboard()
 
-axes[0].imshow(annotated_visor)
-axes[0].set_title(f"1. Point A Visor HUD ({nav_id})\n{num_cv_hazards} CV Hazards | Vis: {vis_pct:.0f}%")
-axes[0].axis("off")
 
-h, w, _ = orbital_map.shape
-cell_h, cell_w = h / GRID_SIZE, w / GRID_SIZE
-axes[1].imshow(orbital_map)
+timer = fig.canvas.new_timer(interval=400)
+timer.add_callback(check_mqtt_timer)
+timer.start()
 
-for r in range(GRID_SIZE):
-    for c in range(GRID_SIZE):
-        if np.isinf(cost_grid[r, c]):
-            is_rad = (RAD_ROWS[0] <= r < RAD_ROWS[1] and RAD_COLS[0] <= c < RAD_COLS[1])
-            is_salt = (salt_hazard_active and SALT_ROWS[0] <= r < SALT_ROWS[1] and SALT_COLS[0] <= c < SALT_COLS[1])
-            color = "red" if is_rad else ("purple" if is_salt else "darkorange")
-            axes[1].add_patch(plt.Rectangle((c * cell_w, r * cell_h), cell_w, cell_h, color=color, alpha=0.58))
-        elif cost_grid[r, c] > 2.2:
-            axes[1].add_patch(plt.Rectangle((c * cell_w, r * cell_h), cell_w, cell_h, color="gold", alpha=0.35))
-
-if safe_path:
-    py = [(r + 0.5) * cell_h for r, _ in safe_path]
-    px = [(c + 0.5) * cell_w for _, c in safe_path]
-    axes[1].plot(px, py, color="lime", linewidth=3, label=f"Safe A* Path ({total_distance_m} m)")
-
-axes[1].scatter([(start_pt[1] + 0.5) * cell_w], [(start_pt[0] + 0.5) * cell_h], color="cyan", s=110, zorder=5, label=f"Point A {start_pt}")
-axes[1].scatter([(goal_pt[1] + 0.5) * cell_w], [(goal_pt[0] + 0.5) * cell_h], color="yellow", marker="*", s=220, zorder=5, label=f"Point B {goal_pt}")
-axes[1].set_title(f"2. Gale Crater Route: {target_name}\n(Red=RAD, Purple=Perchlorate, Orange=Boulder)")
-axes[1].legend(loc="lower left", fontsize=8)
-axes[1].axis("off")
-
-axes[2].imshow(annotated_science)
-axes[2].set_title(f"3. Point B Science Macro ({sci_id})\n{mineral_feature_count} Grain Boundaries | {science_rationale[:34]}...")
-axes[2].axis("off")
-
-plt.tight_layout()
-plt.savefig(ROUTE_PLOT_PATH, dpi=150)
+# Initial draw & show
+update_dashboard()
 plt.show()
 
-navigation_packet = {
-    "sector": "Gale Crater, Mars",
-    "sol_sampled": active_sol,
-    "wokwi_suit_telemetry": wokwi_data,
-    "point_a_visor_start": {"grid": list(start_pt), "lat": start_lat, "lon": start_lon, "visor_image": str(NAVCAM_PATH.name)},
-    "point_b_target": {
-        "name": target_name, "grid": list(goal_pt), "lat": goal_lat, "lon": goal_lon,
-        "science_rationale": science_rationale, "macro_image": str(SCIENCE_PATH.name),
-        "cv_detected_micro_features": mineral_feature_count,
-    },
-    "route_metrics": {
-        "total_distance_m": total_distance_m,
-        "estimated_walk_time_min": est_walk_time_min,
-        "estimated_o2_cost_pct": est_o2_used_pct,
-        "cv_hazard_cells_avoided": num_cv_hazards,
-    },
-    "turn_by_turn_instructions": eva_instructions,
-}
-
-with open(JSON_OUT_PATH, "w", encoding="utf-8") as f:
-    json.dump(navigation_packet, f, indent=2)
+if mqtt_client is not None:
+    mqtt_client.loop_stop()
+    mqtt_client.disconnect()
