@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # GALE CRATER 5-HAZARD EVA SIMULATOR — CROSS-PLATFORM LAUNCHER
-# Automatically unpacks gale-frontend.zip if needed, installs dependencies,
+# Handles "gale-frontend (new).zip", "gale-frontend.zip", "Wokwi.zip",
+# installs dependencies, injects the updated 3D Java + Python code,
 # starts the Python Backend, and launches the 3D Gale Crater Frontend.
 # ==============================================================================
 
@@ -94,29 +95,41 @@ fi
 "$VENV_PY" -m pip install -r "$REQ_FILE" --quiet
 
 # ------------------------------------------------------------------------------
-# 3. LOCATE OR UNZIP gale-frontend.zip AUTOMATICALLY
+# 3. LOCATE OR UNZIP "gale-frontend (new).zip" / "gale-frontend.zip" / "Wokwi.zip"
 # ------------------------------------------------------------------------------
-FRONTEND_DIR=""
+echo "[3/5] Checking archives and project directories..."
 
+"$VENV_PY" - << 'PYEOF'
+import zipfile
+from pathlib import Path
+
+root = Path(".").resolve()
+
+# 1. Unpack Wokwi.zip if present and not unpacked
+for wokwi_zip in root.glob("*[Ww]okwi*.zip"):
+    if not (root / "Wokwi").exists() and not (root / "project(1)").exists():
+        print(f"      Extracting {wokwi_zip.name} ...")
+        with zipfile.ZipFile(wokwi_zip, "r") as zf:
+            zf.extractall(root / "Wokwi")
+
+# 2. Unpack gale-frontend (new).zip or gale-frontend.zip if gradlew not yet extracted
+has_gradlew = any(root.rglob("gradlew"))
+if not has_gradlew:
+    frontend_zips = sorted(root.glob("*gale-frontend*.zip"))
+    if frontend_zips:
+        target_zip = frontend_zips[0]
+        print(f"      Extracting '{target_zip.name}' ...")
+        with zipfile.ZipFile(target_zip, "r") as zf:
+            zf.extractall(root)
+        # If zip extracted core/ and build.gradle directly without gale-frontend/ wrapper, organize or detect it
+PYEOF
+
+FRONTEND_DIR=""
 if [ -d "$SCRIPT_DIR/gale-frontend" ] && [ -f "$SCRIPT_DIR/gale-frontend/build.gradle" ]; then
     FRONTEND_DIR="$SCRIPT_DIR/gale-frontend"
 elif [ -f "$SCRIPT_DIR/build.gradle" ] && [ -d "$SCRIPT_DIR/core" ]; then
     FRONTEND_DIR="$SCRIPT_DIR"
-elif [ -f "$SCRIPT_DIR/gale-frontend.zip" ]; then
-    echo "[3/5] Extracting gale-frontend.zip using Python zipfile (works without unzip package)..."
-    "$VENV_PY" -c "
-import zipfile, pathlib
-z_path = pathlib.Path('gale-frontend.zip')
-with zipfile.ZipFile(z_path, 'r') as zf:
-    zf.extractall('.')
-"
-    if [ -d "$SCRIPT_DIR/gale-frontend" ]; then
-        FRONTEND_DIR="$SCRIPT_DIR/gale-frontend"
-    elif [ -f "$SCRIPT_DIR/build.gradle" ]; then
-        FRONTEND_DIR="$SCRIPT_DIR"
-    fi
 else
-    # Search one or two levels deep for gradlew
     FOUND_GRADLEW="$(find "$SCRIPT_DIR" -maxdepth 3 -name "gradlew" | head -n 1)"
     if [ -n "$FOUND_GRADLEW" ]; then
         FRONTEND_DIR="$(dirname "$FOUND_GRADLEW")"
@@ -124,17 +137,18 @@ else
 fi
 
 if [ -z "$FRONTEND_DIR" ] || [ ! -d "$FRONTEND_DIR" ]; then
-    echo "[ERROR] Could not find gale-frontend directory or gale-frontend.zip in $SCRIPT_DIR"
+    echo "[ERROR] Could not find gale-frontend directory or *gale-frontend*.zip in $SCRIPT_DIR"
     ls -la "$SCRIPT_DIR"
     exit 1
 fi
 
-echo "[3/5] Found Frontend project at: $FRONTEND_DIR"
+echo "      Frontend located at: $FRONTEND_DIR"
 
-# If you placed an updated GalePanoramaApp.java in Mars-main/, copy it into core/ automatically
-if [ -f "$SCRIPT_DIR/GalePanoramaApp.java" ] && [ -d "$FRONTEND_DIR/core/src/main/java/com/gale/viewer" ]; then
-    echo "      Copying updated GalePanoramaApp.java into $FRONTEND_DIR/core/src/main/java/com/gale/viewer/ ..."
-    cp "$SCRIPT_DIR/GalePanoramaApp.java" "$FRONTEND_DIR/core/src/main/java/com/gale/viewer/GalePanoramaApp.java"
+# If updated GalePanoramaApp.java is placed in root, copy it into the extracted frontend automatically
+JAVA_TARGET="$FRONTEND_DIR/core/src/main/java/com/gale/viewer/GalePanoramaApp.java"
+if [ -f "$SCRIPT_DIR/GalePanoramaApp.java" ] && [ -d "$(dirname "$JAVA_TARGET")" ]; then
+    cp "$SCRIPT_DIR/GalePanoramaApp.java" "$JAVA_TARGET"
+    echo "      Synced updated GalePanoramaApp.java into frontend."
 fi
 
 # ------------------------------------------------------------------------------
@@ -150,7 +164,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if [ "$USE_BACKUP" -eq 1 ]; then
+if [ "$USE_BACKUP" -eq 1 ] && [ -f "$SCRIPT_DIR/mars_nav.py" ]; then
     echo "[4/5] Starting Backup Backend (mars_nav.py)..."
     "$VENV_PY" "$SCRIPT_DIR/mars_nav.py" 3 &
     BACKEND_PID=$!
@@ -167,10 +181,12 @@ for _ in $(seq 1 25); do
         break
     fi
     if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
-        echo "[WARN] Main backend exited early. Failing over to backup mars_nav.py..."
-        "$VENV_PY" "$SCRIPT_DIR/mars_nav.py" 3 &
-        BACKEND_PID=$!
-        sleep 2
+        if [ -f "$SCRIPT_DIR/mars_nav.py" ]; then
+            echo "[WARN] Main backend exited early. Failing over to backup mars_nav.py..."
+            "$VENV_PY" "$SCRIPT_DIR/mars_nav.py" 3 &
+            BACKEND_PID=$!
+            sleep 2
+        fi
         break
     fi
     sleep 1
